@@ -1,0 +1,104 @@
+stages:
+  - sast-test
+  - build-demo
+  - build
+  - deploy-to-demo
+  - deploy
+
+SAST Testing:
+  stage: sast-test
+  tags:
+    - usp-sast-testing
+  image: returntocorp/semgrep
+  script:
+    - apk add --no-cache --repository http://dl-cdn.alpinelinux.org/alpine/v3.12/community/ --allow-untrusted gnu-libiconv=1.15-r2
+    - mv requirements.txt req.txt
+    - iconv -f UTF-16 -t UTF-8 req.txt > requirements.txt
+    - semgrep ci -o SASTsemgrep.json --json
+    - ls
+    # - if grep -q "HIGH" SASTsemgrep.json; then exit 1; else true; fi
+  variables:
+    SEMGREP_APP_TOKEN: $SEMGREP_APP_TOKEN
+    # GITLAB_TOKEN: "$SEMGREP_GITLAB_PAT"
+  artifacts:
+    paths:
+      - SASTsemgrep.json
+    reports:
+      sast: SASTsemgrep.json
+  only:
+    - qa
+
+.build-template:
+  tags:
+    - usp-ms-apps
+  script:
+    # - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - aws ecr get-login-password | docker login --username AWS --password-stdin $ECR_REGISTRY
+    - echo $TAG_LATEST
+    - echo $TAG_COMMIT
+    - docker build -t $TAG_LATEST -t $TAG_COMMIT .
+    - docker push $TAG_COMMIT
+    - docker push $TAG_LATEST
+    - rm -rf ~/.aws
+
+build for dev, qa, or prod:
+  environment:
+    name: ${CI_COMMIT_REF_NAME}-env
+  stage: build
+  extends: .build-template
+  only:
+    - develop
+    - qa
+    - main
+
+build for demo:
+  environment:
+    name: demo-env
+  stage: build-demo
+  extends: .build-template
+  only:
+    - main
+
+.deploy-template:
+  tags:
+    - usp-ms-apps
+  script:
+    - cat "$KEY_ID_RSA" | tr -d '\r' > key.pem
+    - chmod 400 key.pem
+    # - ssh -i key.pem -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY"
+    - ssh -i key.pem -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID"
+    - ssh -i key.pem -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY"
+    - ssh -i key.pem -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "aws configure set region $AWS_DEFAULT_REGION"
+    - ssh -i key.pem -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "aws ecr get-login-password | docker login --username AWS --password-stdin $ECR_REGISTRY"
+    - ssh -i key.pem -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "docker pull $TAG_COMMIT"
+    - ssh -i key.pem -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "docker pull $TAG_LATEST"
+    - ssh -i key.pem -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "rm -rf ~/.aws"
+    - ssh -i key.pem -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "mkdir -p ~/apps/$CI_PROJECT_NAME || true"
+    - cat $ENV_FILE > ${CI_PROJECT_NAME}.env
+    - scp -i key.pem -o StrictHostKeyChecking=no ${CI_PROJECT_NAME}.env $SERVER_USER@$SERVER_IP:~/apps/$CI_PROJECT_NAME/
+    - rm ${CI_PROJECT_NAME}.env
+    - scp -i key.pem -o StrictHostKeyChecking=no docker-compose.yml $SERVER_USER@$SERVER_IP:~/apps/$CI_PROJECT_NAME/
+    # - ssh -i key.pem -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "docker ps -aq | xargs docker rm || true"
+    - ssh -i key.pem -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "export IMAGE_TAG=$TAG_COMMIT && export CI_PROJECT_NAME=$CI_PROJECT_NAME && cd ~/apps/$CI_PROJECT_NAME && docker compose down --remove-orphans"
+    - ssh -i key.pem -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "export IMAGE_TAG=$TAG_COMMIT && export CI_PROJECT_NAME=$CI_PROJECT_NAME && cd ~/apps/$CI_PROJECT_NAME && docker compose pull"
+    - ssh -i key.pem -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "export IMAGE_TAG=$TAG_COMMIT && export CI_PROJECT_NAME=$CI_PROJECT_NAME && cd ~/apps/$CI_PROJECT_NAME && docker compose up -d"
+    - ssh -i key.pem -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "docker image prune -af || true"
+    - rm -f key.pem
+
+deploy to dev, qa, or prod:
+  environment:
+    name: ${CI_COMMIT_REF_NAME}-env
+  stage: deploy
+  extends: .deploy-template
+  only:
+    - develop
+    - qa
+    - main
+
+deploy to demo:
+  environment:
+    name: demo-env
+  stage: deploy-to-demo
+  extends: .deploy-template
+  only:
+    - main
